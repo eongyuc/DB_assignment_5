@@ -3,6 +3,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/stat.h>
 
 
 /**
@@ -18,7 +21,60 @@
  */
 int open_or_create_tree(const char *file_path, int leaf_order, int internal_order) {
 	// TODO: Implement here
-	return -1;
+	// 1. 기존 파일 열기 (O_RDWR는 읽기쓰기 다 되게 FILE 연다는 뜻)
+	int fd = open(file_path, O_RDWR);
+
+	if (fd >= 0) {
+		return fd;
+	}
+
+	// file이 없는 경우에만 새로 생성
+	// ENOENT는 파일이 존재하지 않는다는 오류 코드
+	// 즉, 파일이 없는 것이 아니라 권한 등의 문제일 경우 새 파일 안 만들기
+	if (errno != ENOENT) {
+		return -1;
+	}
+
+	// 2. 새 DB 파일 생성
+	// O_EXCL은 O_CREAT와 함께 사용하여 파일이 이미 존재한다면 생성에 실패.
+	fd = open(file_path, O_RDWR | O_CREAT | O_EXCL, 0644);
+
+	if (fd < 0) {
+		return -1;
+	}
+
+	// 3. 초기 파일 크기 확보
+	// ftruncate는 파일의 크기를 지정한 크기로 변경하는 함수. 변경 실패시 -1 반환
+	if (ftruncate(fd, (off_t)INIT_PAGE_COUNT * PAGE_SIZE) == -1) {
+		close(fd);
+		return -1;
+	}
+
+	// 4. Header Page 초기화
+	header_page header = {0}; // 모든 필드의 값을 0으로 맞춤.
+
+	header.free_pgn = 1;
+	header.root_pgn = -1;
+	header.num_pages = INIT_PAGE_COUNT;
+	header.leaf_order = leaf_order;
+	header.internal_order = internal_order;
+
+	// 5. Free Page들을 연결한다.
+	for (int64_t i = 1; i< INIT_PAGE_COUNT; i++) {
+		int64_t next_pgn = (i == INIT_PAGE_COUNT -1) ? -1 : i+1;
+		off_t offset = (off_t)i * PAGE_SIZE;
+
+		// pwrite는 실제로 기록한 바이트 수를 반환함. 
+		if (pwrite(fd, &next_pgn, sizeof(next_pgn), offset) != sizeof(next_pgn)) {
+			close(fd);
+			return -1;
+		}
+	}
+
+	// 6. Header Page를 디스크에 기록
+	write_header_page(fd, &header);
+
+	return fd;
 }
 
 /**
