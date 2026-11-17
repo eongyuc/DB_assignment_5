@@ -131,6 +131,77 @@ void write_header_page(int fd, const header_page* src) {
  */
 void load_page(int fd, int64_t pgn, page* dest) {
 	// TODO: Implement here
+	off_t base = (off_t)pgn * PAGE_SIZE;
+
+	// 1. 메모리 구조체 초기화 및 페이지 번호 설정
+	*dest = (page){0}; // 메모리 구조체 초기화
+	dest->pgn = pgn; // 페이지 번호 설정
+
+	// 2. 공통 page header 읽기
+	if (pread(fd, &dest->parent_pgn, 8, base) != 8) { 
+		exit_with_err_msg("Error loading parent page number");
+	}
+	// 디스크에서 is_leaf는 4byte이지만 메모리의 dest->is_leaf는 bool이라 1byte임.
+	// 덮어쓰지 않기 위해서 한 번 걸러서 받음.
+	int32_t is_leaf = 0;
+
+	if (pread(fd, &is_leaf, 4, base + 8) != 4) {
+		exit_with_err_msg("Error loading leaf flag");
+	}
+
+	if (is_leaf != 0) dest->is_leaf = true;
+	else dest->is_leaf = false;
+
+	if (pread(fd, &dest->num_keys, 4, base + 12) > 4) {
+		exit_with_err_msg("Error loading number of keys");
+	}
+
+	// 3. leaf page 읽기
+	if(dest->is_leaf) {
+		if (dest->num_keys < 0 || dest->num_keys > 31) {
+			exit_with_err_msg("Invalid leaf key count");
+		}
+
+		if (pread(fd, &dest->right_sibling_pgn, 8, base + 120) != 8) {
+			exit_with_err_msg("Error loading right sibling");
+		}
+
+		for (int i = 0; i < dest->num_keys; i++) {
+			off_t offset = base + 128 + i*128; // n번째 record 위치. page header 크기가 128 byte이므로 그 다음부터 key들어감.
+
+			if (pread(fd, &dest->keys[i], 8, offset) != 8) {
+				exit_with_err_msg("Error loading leaf key");
+			} // leaf node는 key값 8바이트, value값 120byte.
+
+			if (pread(fd, dest->records[i].value, 120, offset + 8) != 120) {
+				exit_with_err_msg("Error loading leaf value");
+			}
+		}
+	}
+
+	// 4. Internal Page 읽기
+	else {
+		if (dest->num_keys < 0 || dest->num_keys > 248) { // 248개의 자식노드 가질 수 있음.
+			exit_with_err_msg("Invalid internal key count");
+		}
+				
+		// 마지막 child page number를 page header의 offset 120에 별도로 저장함.
+		if (pread(fd, &dest->child_pgns[dest->num_keys], 8, base + 120) != 8) {
+			exit_with_err_msg("Error loading rightmost child");
+		}
+
+		for (int i = 0; i < dest->num_keys; i++) {
+			off_t offset = base + 128 + i*16;
+
+			if (pread(fd, &dest->keys[i], 8, offset) != 8){
+				exit_with_err_msg("Error loading internal key");
+			}
+
+			if (pread(fd, &dest->child_pgns[i], 8, offset + 8) != 8) {
+				exit_with_err_msg("Error loading child page number");
+			}
+		}
+	}
 }
 
 /**
