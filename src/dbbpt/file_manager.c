@@ -152,7 +152,7 @@ void load_page(int fd, int64_t pgn, page* dest) {
 	if (is_leaf != 0) dest->is_leaf = true;
 	else dest->is_leaf = false;
 
-	if (pread(fd, &dest->num_keys, 4, base + 12) > 4) {
+	if (pread(fd, &dest->num_keys, 4, base + 12) != 4) {
 		exit_with_err_msg("Error loading number of keys");
 	}
 
