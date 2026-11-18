@@ -211,6 +211,52 @@ void load_page(int fd, int64_t pgn, page* dest) {
  */
 void write_page(int fd, const page* src) {
 	// TODO: Implement here
+	
+	off_t base = (off_t)src->pgn*PAGE_SIZE;
+
+	// 1. 페이지의 공통 header 기록
+	if (pwrite(fd, &src->parent_pgn, 8, base) != 8) exit_with_err_msg("Error writing parent page number");
+
+	int32_t is_leaf = src->is_leaf ? 1 : 0;
+
+	if (pwrite(fd, &is_leaf, 4, base + 8) != 4) exit_with_err_msg("Error writing leaf flag");
+	if (pwrite(fd, &src->num_keys, 4, base + 12) != 4) exit_with_err_msg("Error writing number of keys");
+
+	// 2. Leaf Page 기록
+	if (src->is_leaf) {
+		if (src->num_keys < 0 || src->num_keys > 31) {
+			fprintf(stderr, "Invalid leaf key count\n");
+			exit(EXIT_FAILURE);
+		}
+
+		if (pwrite(fd, &src->right_sibling_pgn, 8, base + 120) != 8) exit_with_err_msg("Error writing right sibling");
+
+		// key값 넣기.
+		for (int i = 0; i < src->num_keys; i++) {
+			off_t offset = base + 128 + i * 128;
+
+			if (pwrite(fd, &src->keys[i], 8, offset) != 8) exit_with_err_msg("Error writing leaf key");
+			if (pwrite(fd, src->records[i].value, 120, offset + 8) != 120) exit_with_err_msg("Error writing leaf value");
+		}
+	}
+
+	// 3. internal page 기록
+	else {
+		if (src->num_keys < 0 || src->num_keys > 248) {
+			fprintf(stderr, "Invalid internal key count\n");
+			exit(EXIT_FAILURE);
+		}
+
+		if (pwrite(fd, &src->child_pgns[src->num_keys], 8, base + 120) != 8)
+			exit_with_err_msg("Error writing rightmost child");
+
+		for (int i = 0; i< src->num_keys; i++) {
+			off_t offset = base + 128 + i * 16;
+
+			if (pwrite(fd, &src->keys[i], 8, offset) != 8) exit_with_err_msg("Error writing internal key");
+			if (pwrite(fd, &src->child_pgns[i], 8, offset + 8) != 8) exit_with_err_msg("Error writing child page number");
+		}
+	}
 }
 
 /**
