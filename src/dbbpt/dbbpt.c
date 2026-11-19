@@ -90,6 +90,25 @@ record *db_find(int fd, int64_t key, bool verbose, page **leaf_out) {
 // TODO: define helper functions if you need
 
 // Insertion API
+
+static void split_leaf(
+    int fd,
+    header_page *header,
+    page *leaf,
+    int64_t key,
+    const char *value,
+    int64_t *separator_key,
+    int64_t *new_leaf_pgn
+);
+
+static void insert_into_parent(
+    int fd,
+    header_page *header,
+    int64_t left_pgn,
+    int64_t parent_pgn,
+    int64_t separator_key,
+    int64_t right_pgn
+);
 /**
  * @brief Insert a record with the given key and value.
  * @param fd[in] The file descriptor of the database file.
@@ -203,7 +222,7 @@ void db_insert(int fd, int64_t key, char *value) {
 	int64_t separator_key;
 	int64_t new_leaf_pgn;
 
-	split_leaf(fd, &header, leaf, value, &separator_key, &new_leaf_pgn);
+	split_leaf(fd, &header, leaf, key, value, &separator_key, &new_leaf_pgn);
 
 	insert_into_parent(fd, &header, leaf->pgn, leaf->parent_pgn,
 						separator_key, new_leaf_pgn);
@@ -375,7 +394,7 @@ static void create_new_root(int fd, header_page *header, int64_t left_pgn,
 	root->num_keys = 1;
 
 	// 3. 구분 key와 자식 page 번호 설정
-	root->key[0] = separator_key;
+	root->keys[0] = separator_key;
 	root->child_pgns[0] = left_pgn;
 	root->child_pgns[1] = right_pgn;
 
