@@ -285,7 +285,54 @@ page *alloc_page(int fd) {
  */
 page *alloc_page1(int fd, header_page *header_page) {
 	// TODO: Implement here
-	return NULL;
+
+	// 1. Free page가 없으면 파일 크기를 두 배로 확장
+	if (header_page->free_pgn == -1) {
+		int64_t old_count = header_page->num_pages;
+		int64_t new_count = old_count * 2;
+
+		if (ftruncate(fd, (off_t)new_count * PAGE_SIZE) == -1) exit_with_err_msg("Error extending database file");
+
+		// 새로 생성한 페이지들을 Free List로 연결
+		for (int64_t i = old_count; i < new_count; i++) {
+			int64_t next_pgn = (i == new_count -1) ? -1 : i + 1;
+
+			off_t offset = (off_t)i * PAGE_SIZE;
+
+			if (pwrite(fd, &next_pgn, 8, offset) != 8) exit_with_err_msg("Error initializing free page");
+		}
+
+		header_page->free_pgn = old_count;
+		header_page->num_pages = new_count;
+
+		write_header_page(fd, header_page);
+	}
+
+	// 2. Free List의 첫 번째 페이지 선택
+	int64_t allocated_pgn = header_page->free_pgn;
+
+	// 3. 선택한 free page의 next_pgn 읽기
+	int64_t next_pgn;
+
+	off_t offset = (off_t)allocated_pgn * PAGE_SIZE;
+
+	if (pread(fd, &next_pgn, 8, offset) != 8) exit_with_err_msg("Error reading next free page");
+	
+	// 4. Header의 free list 시작점 변경
+	header_page->free_pgn = next_pgn;
+	write_header_page(fd, header_page);
+
+	// 5. 메모리에 새로운 page 구조체 생성
+	page *new_page = calloc(1, sizeof(page));
+
+	if (new_page == NULL) exit_with_err_msg("Error allocating page memory");
+
+	new_page->pgn = allocated_pgn;
+	new_page->parent_pgn = -1;
+	new_page->right_sibling_pgn = -1;
+	new_page->next_pgn = -1;
+
+	return new_page;
 }
 
 /**
@@ -295,6 +342,23 @@ page *alloc_page1(int fd, header_page *header_page) {
  */
 void free_page(int fd, int64_t pgn) {
 	// TODO: Implement here
+
+	// 1. Header Page 읽기
+	header_page header;
+	load_header_page(fd, &header); // header에 header page 넣기.
+
+	// 2. 반환할 페이지를 기존 Free list의 맨 앞에 연결
+	int64_t next_pgn = header.free_pgn;
+	off_t offset = (off_t)pgn * PAGE_SIZE;
+
+	// next_pgn에 해당하는 숫자를 pgn자리에 write함. (offset 이용)
+	if (pwrite(fd, &next_pgn, 8, offset) != 8) exit_with_err_msg("Error writing next free page");
+
+	// 3. Header가 반환한 페이지를 가리키도록 변경
+	header.free_pgn = pgn;
+
+	// 4. Header Page 저장
+	write_header_page(fd, &header);
 }
 
 /**
