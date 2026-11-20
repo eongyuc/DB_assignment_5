@@ -567,6 +567,46 @@ static void insert_into_parent(
     );
 }
 
+
+// Helper function prototypes for deletion
+
+static void coalesce_leaf(
+    int fd, page *left, page *right
+);
+
+static void remove_from_internal(
+    int fd, page *parent, int key_index
+);
+
+static void adjust_root_after_delete(
+    int fd, header_page *header, page *root
+);
+
+static void redistribute_leaf(
+    int fd, page *leaf, page *sibling,
+    page *parent, int leaf_index, bool from_left
+);
+
+static void redistribute_internal(
+    int fd, page *node, page *sibling,
+    page *parent, int node_index, bool from_left
+);
+
+static void coalesce_internal(
+    int fd, page *left, page *right,
+    int64_t separator_key
+);
+
+static void repair_internal(
+    int fd, header_page *header, int64_t node_pgn
+);
+
+static bool refresh_separator_keys(
+    int fd, int64_t pgn, int64_t *min_key
+);
+
+static void refresh_tree_after_delete(int fd);
+
 // Deletion API
 /**
  * @brief Delete a record with the given key.
@@ -681,7 +721,7 @@ void db_delete(int fd, int64_t key) {
 	// 11. 어느 형제에게서도 빌릴 수 없는 경우
 	// 왼쪽 형제가 있으면 왼쪽 leaf에 병합
 	if (leaf_index > 0) {
-		page left_sibilng;
+		page left_sibling;
 		load_page(fd, parent.child_pgns[leaf_index - 1], &left_sibling);
 
 		coalesce_leaf(fd, &left_sibling, &leaf);
@@ -701,6 +741,7 @@ void db_delete(int fd, int64_t key) {
 
 	// 12. leaf 병합으로 key가 감소한 parent 복구
 	repair_internal(fd, &header, parent.pgn);
+	refresh_tree_after_delete(fd);
 	return;
 }
 
