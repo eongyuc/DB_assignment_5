@@ -11,6 +11,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+static void repair_internal(
+    int fd,
+    header_page *header,
+    int64_t node_pgn
+);
+
 // FUNCTION DEFINITIONS.
 // Find API
 /**
@@ -569,10 +575,574 @@ static void insert_into_parent(
  */
 void db_delete(int fd, int64_t key) {
 	// TODO: Implement here
+
+	// 1. header page 읽기
+	header_page header;
+	load_header_page(fd, &header);
+
+	// 빈 트리라면 삭제x
+	if (header.root_pgn == -1) return;
+
+	// 2. 삭제할 key 있는 leaf 찾기
+	page leaf;
+	int64_t cur_pgn = header.root_pgn;
+
+	load_page(fd, cur_pgn, &leaf);
+	while (!leaf.is_leaf) {
+		int i = 0;
+		while (i < leaf.num_keys && key >= leaf.keys[i]) { i++; }
+
+		cur_pgn = leaf.child_pgns[i];
+		load_page(fd, cur_pgn, &leaf);
+	}
+
+	// 3. leaf page에서 삭제할 key 위치 찾기
+	int delete_index = 0;
+	while (delete_index < leaf.num_keys && leaf.keys[delete_index] != key) {
+		delete_index++;
+	}
+
+	// key 못 찾으면 종료.
+	if (delete_index == leaf.num_keys) return;
+
+	// 4. key, record 한 칸 왼쪽으로
+	for (int i = delete_index; i < leaf.num_keys - 1; i++) {
+		leaf.keys[i] = leaf.keys[i + 1];
+		leaf.records[i] = leaf.records[i + 1];
+	}
+
+	leaf.num_keys--;
+
+	// 5. root가 leaf인 경우
+	if (leaf.pgn == header.root_pgn) {
+		if (leaf.num_keys == 0) {
+			// 트리가 완전히 빔.
+			header.root_pgn = -1;
+			write_header_page(fd, &header);
+			free_page(fd, leaf.pgn);
+		} else {
+			write_page(fd, &leaf);
+		}
+
+		return;
+	}
+
+	// 6. 일반 leaf인 경우
+	write_page(fd, &leaf);
+
+	// 7. 최소 key 개수 계산
+	int min_keys = (header.leaf_order + 1) / 2;
+
+	// 최소 개수 만족하면 재분배 필요 없음.
+	if (leaf.num_keys >= min_keys) {
+		refresh_tree_after_delete(fd);
+		return;
+	}
+
+	// 8. parent page 읽기
+	page parent;
+	load_page(fd, leaf.parent_pgn, &parent);
+
+	// parent에서 현재 leaf의 위치 찾기
+	int leaf_index = 0;
+	while (leaf_index <= parent.num_keys && 
+			parent.child_pgns[leaf_index] != leaf.pgn) {
+		leaf_index++;
+	}
+
+	if (leaf_index > parent.num_keys) exit_with_err_msg("Leaf not found in parent");
+
+	// 9. 왼쪽 형제에게 빌릴 수 있는지 확인
+	if (leaf_index > 0) {
+		page left_sibling;
+
+		load_page(fd, parent.child_pgns[leaf_index - 1], &left_sibling);
+
+		if (left_sibling.num_keys > min_keys) {
+			redistribute_leaf(fd, &leaf, &left_sibling, &parent, leaf_index, true);
+			refresh_tree_after_delete(fd);
+			return;
+		}
+	}
+
+	// 10. 오른쪽 형제에게 빌릴 수 있는지 확인
+	if (leaf_index < parent.num_keys) {
+		page right_sibling;
+		
+		load_page(fd, parent.child_pgns[leaf_index + 1], &right_sibling);
+
+		if (right_sibling.num_keys > min_keys) {
+			redistribute_leaf(fd, &leaf, &right_sibling, &parent, leaf_index, false);
+			refresh_tree_after_delete(fd);
+			return;
+		}
+	}
+
+	// 11. 어느 형제에게서도 빌릴 수 없는 경우
+	// 왼쪽 형제가 있으면 왼쪽 leaf에 병합
+	if (leaf_index > 0) {
+		page left_sibilng;
+		load_page(fd, parent.child_pgns[leaf_index - 1], &left_sibling);
+
+		coalesce_leaf(fd, &left_sibling, &leaf);
+
+		// 왼쪽 형제와 현재 leaf 사이의 구분 key 제거
+		remove_from_internal(fd, &parent, leaf_index - 1);
+	} else {
+		// 왼쪽 형제가 없으면 오른쪽 leaf를 현재 leaf에 병합
+		page right_sibling;
+		load_page(fd, parent.child_pgns[leaf_index + 1], &right_sibling);
+
+		coalesce_leaf(fd, &leaf, &right_sibling);
+
+		// 현재 leaf와 오른쪽 형제 사이의 구분 key 제거
+		remove_from_internal(fd, &parent, leaf_index);
+	}
+
+	// 12. leaf 병합으로 key가 감소한 parent 복구
+	repair_internal(fd, &header, parent.pgn);
+	return;
 }
 
 // Helper functions for delete API
 // TODO: define helper functions if you need
+
+// 병합을 위한 함수
+static void coalesce_leaf(int fd, page *left, page *right) {
+	// 1. 오른쪽 leaf의 모든 record를 왼쪽 leaf 끝에 복사
+	int start = left->num_keys;
+
+	for (int i = 0; i < right->num_keys; i++) {
+		left->keys[start + i] = right->keys[i];
+		left->records[start + i] = right->records[i];
+	}
+
+	// 2. 왼쪽 leaf의 key 개수 증가
+	left->num_keys += right->num_keys;
+
+	// 3. leaf간 연결 수정
+	left->right_sibling_pgn = right->right_sibling_pgn;
+
+	// 4. 병합 결과를 디스크에 기록
+	write_page(fd, left);
+
+	// 5. 안 쓰는 오른쪽 페이지 반환
+	free_page(fd, right->pgn);
+}
+
+// 병합 시 부모 페이지 key 설정 함수
+static void remove_from_internal(int fd, page *parent, int key_index) {
+	// 1. 삭제할 key 뒤의 key들을 왼쪽으로 이동
+	for (int i = key_index; i < parent->num_keys - 1; i++) {
+		parent->keys[i] = parent->keys[i + 1];
+	}
+
+	// 2. 삭제할 key의 오른쪽 child 포인터 제거
+	for (int i = key_index + 1; i < parent->num_keys; i++) {
+		parent->child_pgns[i] = parent->child_pgns[i + 1];
+	}
+
+	// 3. key 개수 감소
+	parent->num_keys--;
+
+	// 4. 변경된 parent 저장
+	write_page(fd, parent);
+}
+
+// 병합 이후 parent가 root가 되고 key가 0개일 경우 기존 루트 제거, 남은 child를 root로 지정
+static void adjust_root_after_delete(int fd, header_page *header, page *root) {
+	// root에 key가 남아있다면 변경할 필요 없음
+	if (root->num_keys > 0) return;
+
+	// internal root의 유일한 child를 새로운 root로 지정
+	int64_t new_root_pgn = root->child_pgns[0];
+
+	page new_root;
+	load_page(fd, new_root_pgn, &new_root);
+
+	new_root.parent_pgn = -1;
+	write_page(fd, &new_root);
+
+	// header 변경
+	header->root_pgn = new_root_pgn;
+	write_header_page(fd, header);
+
+	// 기존 root 반환
+	free_page(fd, root->pgn);
+}
+
+// 재분배 시 왼쪽 형제와 오른쪽 형제 양쪽에서 빌려오는 경우 처리.
+// 왼쪽할지 오른쪽 할지는 미리 정해져서 들어옴.from_leaf로 처리.
+static void redistribute_leaf(int fd, page *leaf, page *sibling, page *parent,
+								int leaf_index, bool from_left) {
+	if (from_left) { // 왼쪽에서 가져오기
+		// 1. leaf의 기존 데이터들 오른쪽으로 이동
+		for (int i = leaf->num_keys; i > 0; i--) {
+			leaf->keys[i] = leaf->keys[i - 1];
+			leaf->records[i] = leaf->records[i - 1];
+		}
+
+		// 2. 왼쪽 형제의 마지막 record를 가져옴
+		int last = sibling->num_keys - 1;
+
+		leaf->keys[0] = sibling->keys[last];
+		leaf->records[0] = sibling->records[last];
+
+		leaf->num_keys++;
+		sibling->num_keys--;
+
+		// 3. parent 구분 key 갱신
+		parent->keys[leaf_index - 1] = leaf->keys[0];
+	} else { // 오른쪽에서 가져오기
+		// 1. 오른쪽 형제의 첫 record를 leaf끝에 추가
+		int insert_index = leaf->num_keys;
+
+		leaf->keys[insert_index] = sibling->keys[0];
+		leaf->records[insert_index] = sibling->records[0];
+
+		leaf->num_keys++;
+
+		// 2. 오른쪽 형제의 나머지 데이터들을 왼쪽으로 이동
+		for(int i = 0; i < sibling->num_keys - 1; i++) {
+			sibling->keys[i] = sibling->keys[i + 1];
+			sibling->records[i] = sibling->records[i + 1];
+		}
+
+		sibling->num_keys--;
+
+		// 3. parent 구분 key 갱신
+		parent->keys[leaf_index] = sibling->keys[0];
+	}
+
+	// 4. 변경된 세 페이지를 디스크에 저장
+	write_page(fd, leaf);
+	write_page(fd, sibling);
+	write_page(fd, parent);
+}
+
+// internal page의 재분배를 위한 함수
+static void redistribute_internal(
+    int fd,
+    page *node,
+    page *sibling,
+    page *parent,
+    int node_index,
+    bool from_left
+) {
+    if (from_left) {
+        // 1. 현재 Internal의 Key와 Child를 오른쪽으로 이동
+        for (int i = node->num_keys; i > 0; i--) {
+            node->keys[i] = node->keys[i - 1];
+        }
+
+        for (int i = node->num_keys + 1; i > 0; i--) {
+            node->child_pgns[i] = node->child_pgns[i - 1];
+        }
+
+        // 2. Parent의 구분 Key를 현재 Internal로 내림
+        node->keys[0] = parent->keys[node_index - 1];
+
+        // 3. 왼쪽 형제의 마지막 Child를 가져옴
+        node->child_pgns[0] =
+            sibling->child_pgns[sibling->num_keys];
+
+        // 4. 왼쪽 형제의 마지막 Key를 Parent로 올림
+        parent->keys[node_index - 1] =
+            sibling->keys[sibling->num_keys - 1];
+
+        node->num_keys++;
+        sibling->num_keys--;
+
+        // 5. 이동한 Child의 Parent 변경
+        page child;
+        load_page(fd, node->child_pgns[0], &child);
+        child.parent_pgn = node->pgn;
+        write_page(fd, &child);
+
+    } else {
+        // 1. Parent의 구분 Key를 현재 Internal 끝에 추가
+        node->keys[node->num_keys] =
+            parent->keys[node_index];
+
+        // 2. 오른쪽 형제의 첫 Child를 가져옴
+        int64_t moved_child =
+            sibling->child_pgns[0];
+
+        node->child_pgns[node->num_keys + 1] =
+            moved_child;
+
+        // 3. 오른쪽 형제의 첫 Key를 Parent로 올림
+        parent->keys[node_index] = sibling->keys[0];
+
+        node->num_keys++;
+
+        // 4. 오른쪽 형제의 Key와 Child를 왼쪽으로 이동
+        for (int i = 0; i < sibling->num_keys - 1; i++) {
+            sibling->keys[i] = sibling->keys[i + 1];
+        }
+
+        for (int i = 0; i < sibling->num_keys; i++) {
+            sibling->child_pgns[i] =
+                sibling->child_pgns[i + 1];
+        }
+
+        sibling->num_keys--;
+
+        // 5. 이동한 Child의 Parent 변경
+        page child;
+        load_page(fd, moved_child, &child);
+        child.parent_pgn = node->pgn;
+        write_page(fd, &child);
+    }
+
+    // 6. 변경 사항 저장
+    write_page(fd, node);
+    write_page(fd, sibling);
+    write_page(fd, parent);
+}
+
+// 두 internal page를 병합하는 함수
+static void coalesce_internal(
+    int fd,
+    page *left,
+    page *right,
+    int64_t separator_key
+) {
+    int start = left->num_keys;
+
+    // 1. Parent의 구분 Key를 왼쪽 Internal에 추가
+    left->keys[start] = separator_key;
+
+    // 2. 오른쪽 Internal의 Key들을 복사
+    for (int i = 0; i < right->num_keys; i++) {
+        left->keys[start + 1 + i] = right->keys[i];
+    }
+
+    // 3. 오른쪽 Internal의 Child들을 복사
+    for (int i = 0; i <= right->num_keys; i++) {
+        int64_t child_pgn = right->child_pgns[i];
+
+        left->child_pgns[start + 1 + i] = child_pgn;
+
+        // 이동한 Child의 Parent 수정
+        page child;
+        load_page(fd, child_pgn, &child);
+        child.parent_pgn = left->pgn;
+        write_page(fd, &child);
+    }
+
+    // 4. Key 개수 갱신
+    left->num_keys += right->num_keys + 1;
+
+    // 5. 병합 결과 저장
+    write_page(fd, left);
+
+    // 6. 오른쪽 Internal Page 반환
+    free_page(fd, right->pgn);
+}
+
+// 재귀적으로 internal 함수를 재분배, 병합하는 함수
+static void repair_internal(
+    int fd,
+    header_page *header,
+    int64_t node_pgn
+) {
+    page node;
+    load_page(fd, node_pgn, &node);
+
+    // 1. Root인 경우
+    if (node.pgn == header->root_pgn) {
+        adjust_root_after_delete(fd, header, &node);
+        return;
+    }
+
+    // 2. 최소 Key 개수 확인
+    int min_keys = (header->internal_order + 1) / 2 - 1;
+
+    if (node.num_keys >= min_keys) {
+        return;
+    }
+
+    // 3. Parent 읽기
+    page parent;
+    load_page(fd, node.parent_pgn, &parent);
+
+    // Parent에서 현재 Internal의 위치 찾기
+    int node_index = 0;
+
+    while (node_index <= parent.num_keys &&
+           parent.child_pgns[node_index] != node.pgn) {
+        node_index++;
+    }
+
+    if (node_index > parent.num_keys) {
+        exit_with_err_msg("Internal node not found in parent");
+    }
+
+    // 4. 왼쪽 형제에게서 빌릴 수 있는지 확인
+    if (node_index > 0) {
+        page left_sibling;
+
+        load_page(
+            fd,
+            parent.child_pgns[node_index - 1],
+            &left_sibling
+        );
+
+        if (left_sibling.num_keys > min_keys) {
+            redistribute_internal(
+                fd, &node, &left_sibling,
+                &parent, node_index, true
+            );
+            return;
+        }
+    }
+
+    // 5. 오른쪽 형제에게서 빌릴 수 있는지 확인
+    if (node_index < parent.num_keys) {
+        page right_sibling;
+
+        load_page(
+            fd,
+            parent.child_pgns[node_index + 1],
+            &right_sibling
+        );
+
+        if (right_sibling.num_keys > min_keys) {
+            redistribute_internal(
+                fd, &node, &right_sibling,
+                &parent, node_index, false
+            );
+            return;
+        }
+    }
+
+    // 6. 재분배가 불가능하면 병합
+    if (node_index > 0) {
+        // 왼쪽 형제에 현재 Internal을 병합
+        page left_sibling;
+
+        load_page(
+            fd,
+            parent.child_pgns[node_index - 1],
+            &left_sibling
+        );
+
+        int64_t separator_key =
+            parent.keys[node_index - 1];
+
+        coalesce_internal(
+            fd, &left_sibling, &node, separator_key
+        );
+
+        remove_from_internal(
+            fd, &parent, node_index - 1
+        );
+
+    } else {
+        // 오른쪽 형제를 현재 Internal에 병합
+        page right_sibling;
+
+        load_page(
+            fd,
+            parent.child_pgns[node_index + 1],
+            &right_sibling
+        );
+
+        int64_t separator_key =
+            parent.keys[node_index];
+
+        coalesce_internal(
+            fd, &node, &right_sibling, separator_key
+        );
+
+        remove_from_internal(
+            fd, &parent, node_index
+        );
+    }
+
+    // 7. Parent도 Key가 부족해졌을 수 있으므로 재귀 호출
+    repair_internal(fd, header, parent.pgn);
+}
+
+// 서브트리의 최소 Key를 구하고
+// 모든 Internal Page의 구분 Key를 갱신한다.
+//
+// 반환값:
+// true  : 서브트리에 Key가 존재함
+// false : 서브트리가 비어 있음
+static bool refresh_separator_keys(
+    int fd,
+    int64_t pgn,
+    int64_t *min_key
+) {
+    page node;
+    load_page(fd, pgn, &node);
+
+    // 1. Leaf Page인 경우
+    if (node.is_leaf) {
+        if (node.num_keys == 0) {
+            return false;
+        }
+
+        *min_key = node.keys[0];
+        return true;
+    }
+
+    // 2. Internal Page인 경우
+    int64_t child_min;
+
+    // 첫 번째 Child의 최소 Key가
+    // 현재 서브트리 전체의 최소 Key
+    if (!refresh_separator_keys(
+            fd, node.child_pgns[0], &child_min)) {
+        return false;
+    }
+
+    *min_key = child_min;
+
+    // 3. 나머지 Child의 최소 Key를 구분 Key에 반영
+    bool changed = false;
+
+    for (int i = 1; i <= node.num_keys; i++) {
+        if (!refresh_separator_keys(
+                fd, node.child_pgns[i], &child_min)) {
+            return false;
+        }
+
+        if (node.keys[i - 1] != child_min) {
+            node.keys[i - 1] = child_min;
+            changed = true;
+        }
+    }
+
+    // 4. 변경된 Internal Page 저장
+    if (changed) {
+        write_page(fd, &node);
+    }
+
+    return true;
+}
+
+
+static void refresh_tree_after_delete(int fd) {
+    header_page header;
+    load_header_page(fd, &header);
+
+    // 빈 트리라면 갱신할 것이 없음
+    if (header.root_pgn == -1) {
+        return;
+    }
+
+    int64_t min_key;
+
+    if (!refresh_separator_keys(
+            fd, header.root_pgn, &min_key)) {
+        exit_with_err_msg(
+            "Empty subtree after deletion"
+        );
+    }
+}
 
 // Destroy API
 void db_destroy(int fd) {
